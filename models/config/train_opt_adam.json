@@ -1,0 +1,15 @@
+{
+  "lr:decay_every": -1,
+  "lr:decay_factor": 1.0,
+  "lr:imp_ratio_threshold": 0.0,
+  "lr:imp_wait": 2,
+  "lr:min_lr": 0.001,
+  "lr:start_decay_at": 6,
+  "optim:beta1": 0.0,
+  "optim:beta2": 0.999,
+  "optim:epsilon": 1e-09,
+  "train:clip_gradients": 5.0,
+  "train:init_lr": 0.003,
+  "train:max_epoch": 30,
+  "train:optim_class": "tensorflow.train.AdamOptimizer"
+}
