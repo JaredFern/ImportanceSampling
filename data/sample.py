@@ -1,137 +1,76 @@
-import os, logging, kenlm, pickle
+import os, logging, kenlm, pickle, subprocess
 import numpy as np
 import numpy.random as npr
 from collections import Counter
 
-# [sampled{seq_ind, [weight]}]
+def ngram_sample(train_file, exp_name, iwal_opt=0, alpha=1, seq_len=40, batch_size=5E5, batch_cnt=1):
+    print ("Training ngram on random starter set")
+    sentences = [sent for sent in open(train_file, 'r')]
 
-def adaptive_sample(opt):
-        train_file, model_file, sampled_file=None, ppl_file = None,
-                    entropy=False, exp_name='sample', alpha=1, train_cnt=1E6, seq_len=100, save=False):
-        seqs, ppl, prob, sampled_ppl, total_weight, tkn_cnt = [], [], [], [], 0, 0
+    rand_sample(train_file=train_file, exp_name=f'{exp_name}/train-0.txt', batch_size=batch_size, seq_len=seq_len)
+
+    count_cmd = f"ngram-count -text {exp_name}/train-0.txt -write {exp_name}/counts.arpa -lm {exp_name}/combined.arpa -order 5 -unk -kndiscount5;"
+    count_subproc = subprocess.Popen(count_cmd, stdout=subprocess.PIPE, shell=True)
+    count_subproc.wait()
+    model_file = f'{exp_name}/combined.arpa'
+
+    for batch in range(1,batch_cnt):
+        print (f"\nBatch: {batch}")
+        prob, sampled_ppl = [], []
+        tkn_cnt, total_weight, sampled = 0, 0, set()
 
         ngram_model = kenlm.Model(model_file)
-        if opt.sampled_file:
-            sampled = pickle.load(open(opt.sampled_file,'rb'))
+        print (f"Calculating sequence perplexities with: {model_file}")
+        sentence_ppl = [ngram_model.perplexity(sent) for sent in sentences]
 
-        if opt.entropy:
-            ppl = [np.log2(ngram_model.perplexity(line)) for line in open(train_file,'r')]
-        else:
-            ppl = [ngram_model.perplexity(line) for line in open(train_file,'r')]
+        print (f"Sampling Sequences.")
+        mean_ppl, std_ppl, ppl_99 = np.mean(sentence_ppl), np.std(sentence_ppl), np.percentile(sentence_ppl, 99)
+        if iwal_opt == 0: # Z-alpha
+            prob = [(p-mean_ppl)/std_ppl * alpha + 1
+                    if p >= mean_ppl and p < ppl_99 else 1 for p in sentence_ppl]
+        elif iwal_opt == 1: # Z-squared
+            prob = [(alpha * np.sign(p-mean_ppl)*(p-mean_ppl)**2/std_ppl**2 )+ 1
+                    if p >= mean_ppl and p < ppl_99 else 1 for p in sentence_ppl]
+        elif iwal_opt == 2: # Z-Full
+            prob = [alpha*(p-mean_ppl)/std_ppl + 1
+                    if p < ppl_99 and (p-mean_ppl)/std_ppl > -1 else 1 for p in sentence_ppl]
 
-        ppl_99 = np.percentile(ppl, 99)
-        mean_ppl = np.mean([p for p in ppl if p < ppl_99])
-        std_ppl = np.std([p for p in ppl if p < ppl_99])
-
-        prob = [p/std_ppl + 1 if p < ppl_99 else 1 for p in ppl]
-        prob = [p if ind not in sampled else 0 for ind, p in enumerate(prob)]
         total_pr = sum(prob)
         prob[:] = [p/total_pr for p in prob]
 
-        logger.info('Sampling training sequences.')
         sampled_ind = npr.choice(len(prob), int(2E5), p=prob, replace=False)
-
         for ind in sampled_ind:
-            if tkn_cnt > train_cnt: break
+            if tkn_cnt > batch_size: break
             sampled.add(ind)
-            tkn_cnt += len(seqs[ind].split())
-            total_weight += len(seqs[ind].split()) * prob[ind] ** -1
-            if ppl[ind] < ppl_99: sampled_ppl.append(ppl[ind])
+            tkn_cnt += len(sentences[ind].split())
+            total_weight += len(sentences[ind].split()) * prob[ind] ** -1
+            if sentence_ppl[ind] < ppl_99: sampled_ppl.append(sentence_ppl[ind])
 
-        pickle.dump(sampled, open('sampled.bin','rb'))
-        norm_const = train_cnt/total_weight
+        norm_const = batch_size/total_weight
+        with open(f'{exp_name}/train-{batch}.txt', 'w') as ngram:
+            for seq_ind in sampled:
+                sent = sentences[seq_ind].split()
+                while len(sent) > 0:
+                    ngram.write(str(prob[seq_ind]**-1 * norm_const) + " " + " ".join( sent[:seq_len])+'\n')
+                    if len(sent) > seq_len: sent = sent[seq_len:]
+                    else: sent = []
 
-        if opt.save_sample:
-            with open(f'{exp_name}.txt', 'w') as adaptive_ngram:
-                for ind, line in enumerate(open(train_file,'r')):
-                    if seq_ind in sampled:
-                    seq = seqs[seq_ind].split()
-                    while len(seq) > 0:
-                        ngram.write(str(prob[seq_ind]**-1 * norm_const)
-                                    + " " + " ".join( seq[:seq_len])+'\n')
-                        if len(seq) > seq_len: seq = seq[seq_len:]
-                        else: seq = []
+        print (f"Training ngram on batch: {batch}")
+        count_cmd = f"ngram-count -text {exp_name}/train-{batch}.txt -read {exp_name}/counts.arpa -write {exp_name}/counts.arpa -lm {model_file} -order 5 -kndiscount5 -unk;"
+        count_subproc = subprocess.Popen(count_cmd, stdout=subprocess.PIPE, shell=True)
+        count_subproc.wait()
 
-def ngram_sample(train_file=['train.txt'], model_file=['iwal.arpa'], ppl_file = None,
-                 iwal_opt=0, exp_name='sample', alpha=1, train_cnt=1E6, seq_len=100):
-    # iwal_opt: {0: alpha, 1: z-squared, 2: z-full}
-    logger.info("Model: %s (%s Tokens)", exp_name, train_cnt)
-    seqs, ppl, prob, sampled_ppl = [], [], [], []
-    tkn_cnt, total_weight, sampled = 0, 0, set()
-
-    if ppl_file:
-        logger.info('Loading sequence perplexity from file: %s', ppl_file)
-        ppl = pickle.load(open(ppl_file,'rb'))
-        for txt in train_file:
-            for line in open(txt,'r'): seqs.append(line)
-    elif len(model_file) == 1:
-        logger.info('Caculating sequence perplexities.')
-        ngram_model = kenlm.Model(model_file[0])
-        for split in range(len(train_file)):
-            for line in open(train_file[split], 'r'):
-                seqs.append(line)
-                ppl.append(ngram_model.perplexity(line.strip()))
-        pickle.dump(ppl, open('ppl.bin', 'wb'))
-    else:
-        logger.info('Caculating sequence perplexities.')
-        models = [kenlm.Model(i) for i in model_file]
-        for split in range(len(train_file)):
-            for line in open(train_file[split], 'r'):
-                seqs.append(line)
-                ppl.append(np.mean([models[i].perplexity(line).strip()
-                                    for i in range(len(models)) if i != split]))
-        pickle.dump(ppl, open('ppl.bin', 'wb'))
-
-    mean_ppl, std_ppl, ppl_99 = np.mean(ppl), np.std(ppl), np.percentile(ppl, 99)
-    if iwal_opt == 0:
-        prob = [(p-mean_ppl)/std_ppl * alpha + 1
-                if p >= mean_ppl and p < ppl_99 else 1 for p in ppl]
-    elif iwal_opt == 1:
-        prob = [(alpha * np.sign(p-mean_ppl)*(p-mean_ppl)**2/std_ppl**2 )+ 1
-                if p >= mean_ppl and p < ppl_99 else 1 for p in ppl]
-    elif iwal_opt == 2:
-        prob = [alpha*(p-mean_ppl)/std_ppl + 1
-                if p < ppl_99 and (p-mean_ppl)/std_ppl > -1 else 1 for p in ppl]
-
-    total_pr = sum(prob)
-    prob[:] = [p/total_pr for p in prob]
-
-    logger.info('Sampling training sequences.')
-    sampled_ind = npr.choice(len(prob), int(2E5), p=prob, replace=False)
-
-    for ind in sampled_ind:
-        if tkn_cnt > train_cnt: break
-        sampled.add(ind)
-        tkn_cnt += len(seqs[ind].split())
-        total_weight += len(seqs[ind].split()) * prob[ind] ** -1
-        if ppl[ind] < ppl_99: sampled_ppl.append(ppl[ind])
-
-    norm_const = train_cnt/total_weight
-    logger.debug('Average Sampled Sequence Perplexity: %s; Sampled StdDev: %s', np.mean(sampled_ppl), np.std(sampled_ppl))
-    mean_ppl, std_ppl = np.mean([p for p in ppl if p < ppl_99]), np.std([p for p in ppl if p < ppl_99])
-    logger.debug('Average Source Sequence Perplexity: %s; Source StdDev: %s\n',mean_ppl, std_ppl)
-
-    with open(exp_name+'.txt', 'w') as ngram:
-        for seq_ind in sampled:
-            seq = seqs[seq_ind].split()
-            while len(seq) > 0:
-                ngram.write(str(prob[seq_ind]**-1 * norm_const) + " " + " ".join( seq[:seq_len])+'\n')
-                if len(seq) > seq_len: seq = seq[seq_len:]
-                else: seq = []
-
-def rand_sample(train_file='train.txt', out_file='rand.txt', train_cnt=1E6, seq_len=100):
-    seqmap, sampled, sampled_cnt = [], set(), 0
-    with open(train_file, 'r') as f:
-        seqmap = [line for line in f]
-    with open(out_file, 'w') as out:
-        while sampled_cnt < train_cnt:
-            sampled_ind = npr.randint(0,len(seqmap))
-            if sampled_ind not in sampled:
+def rand_sample(train_file, exp_name, seq_len=40, batch_size=1E6, batch_cnt = 1):
+    sampled_cnt = 0
+    os.makedirs(exp_name, exist_ok=True)
+    seqmap = [line for line in open(train_file,'r')]
+    for batch in range(batch_cnt):
+        with open(f'{exp_name}/train-{batch}.txt', 'w') as out:
+            while sampled_cnt < batch_size:
+                sampled_ind = npr.randint(0,len(seqmap))
                 sampled_cnt += len(seqmap[sampled_ind].split())
-                sampled.add(sampled_ind)
                 seq = seqmap[sampled_ind].split()
                 while len(seq) > 0:
-                    out.write("1.00 " + " ".join( seq[:seq_len])+"\n")
+                    out.write("1.0000 " + " ".join( seq[:seq_len])+"\n")
                     if len(seq) > seq_len: seq = seq[seq_len:]
                     else: seq = []
-    pickle.dump(sampled, open('sampled.bin', 'wb'))
